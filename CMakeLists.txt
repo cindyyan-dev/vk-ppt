@@ -1,0 +1,18 @@
+cmake_minimum_required(VERSION 3.22)
+project(vk_ppt LANGUAGES CXX)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
+if(NOT ANDROID)
+  message(FATAL_ERROR "vk-ppt builds for Android only (use the NDK toolchain; build.ps1 does)")
+endif()
+if(NOT VULKAN_HEADERS)
+  message(FATAL_ERROR "Set VULKAN_HEADERS to a Vulkan-Headers include directory")
+endif()
+
+add_library(VkLayer_ppt SHARED layer/entry.cpp)
+target_include_directories(VkLayer_ppt PRIVATE "${VULKAN_HEADERS}")
+target_compile_definitions(VkLayer_ppt PRIVATE VK_NO_PROTOTYPES)
+target_compile_options(VkLayer_ppt PRIVATE -fvisibility=hidden -Wall -Wextra -Wshadow)
+target_link_options(VkLayer_ppt PRIVATE "-Wl,-Bsymbolic" "-Wl,--no-undefined" "-Wl,--exclude-libs,ALL" "-s")
