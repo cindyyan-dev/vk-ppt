@@ -25,14 +25,24 @@ struct InstanceWrapper {
     InstanceWrapper(VkInstance vkHandle, PFN_vkGetInstanceProcAddr vkGetProcAddr, PFN_vkDestroyInstance vkDestroy)
         : handle(vkHandle), getProcAddr(vkGetProcAddr), destroy(vkDestroy) {}
 };
+struct CommandBufferWrapper {
+    enum class RecordingState { Initial, Recording, Executable, Invalid };
+    VkCommandPool pool;
+    RecordingState recordingState = RecordingState::Initial;
+    explicit CommandBufferWrapper(VkCommandPool vkPool) : pool(vkPool) {}
+};
+
 struct DeviceWrapper {
+    VkDevice handle;
     // Forward function lookups to the next layer.
     PFN_vkGetDeviceProcAddr getProcAddr;
     // Keep the next layer's destroy function so we can call it
     // after removing this wrapper from the map.
     PFN_vkDestroyDevice destroy;
-    DeviceWrapper(PFN_vkGetDeviceProcAddr vkGetProcAddr, PFN_vkDestroyDevice vkDestroy)
-        : getProcAddr(vkGetProcAddr), destroy(vkDestroy) {}
+    // Key by the full handle: command buffers share the device's dispatch table.
+    std::unordered_map<VkCommandBuffer, std::unique_ptr<CommandBufferWrapper>> commandBuffers;
+    DeviceWrapper(VkDevice vkHandle, PFN_vkGetDeviceProcAddr vkGetProcAddr, PFN_vkDestroyDevice vkDestroy)
+        : handle(vkHandle), getProcAddr(vkGetProcAddr), destroy(vkDestroy) {}
 };
 
 // A physical device shares its instance's dispatch table. Key by that table so
@@ -120,7 +130,7 @@ VKAPI_ATTR VkResult VKAPI_CALL createDevice(VkPhysicalDevice physicalDevice,
     if (result != VK_SUCCESS) return result;
     auto destroy = reinterpret_cast<PFN_vkDestroyDevice>(getDeviceProcAddr(*device, "vkDestroyDevice"));
     try {
-        std::unique_ptr<DeviceWrapper> record = std::make_unique<DeviceWrapper>(getDeviceProcAddr, destroy);
+        std::unique_ptr<DeviceWrapper> record = std::make_unique<DeviceWrapper>(*device, getDeviceProcAddr, destroy);
         std::lock_guard<std::mutex> guard(stateMutex);
         // This key should not already be in the map.
         // If duplicate keys become possible, update this code to handle them.
@@ -143,7 +153,124 @@ VKAPI_ATTR void VKAPI_CALL destroyDevice(VkDevice device, const VkAllocationCall
         record = std::move(it->second);
         devices.erase(it);
     }
+    record->commandBuffers.clear();
     record->destroy(device, allocator);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL allocateCommandBuffers(VkDevice device,
+        const VkCommandBufferAllocateInfo* info, VkCommandBuffer* buffers) {
+    auto* record = findDevice(dispatchKey(device));
+    if (!record) return VK_ERROR_INITIALIZATION_FAILED;
+    auto allocate = reinterpret_cast<PFN_vkAllocateCommandBuffers>(record->getProcAddr(device, "vkAllocateCommandBuffers"));
+    VkResult result = allocate(device, info, buffers);
+    if (result != VK_SUCCESS || info->level != VK_COMMAND_BUFFER_LEVEL_PRIMARY) return result;
+    uint32_t registered = 0;
+    try {
+        std::lock_guard<std::mutex> guard(stateMutex);
+        for (; registered < info->commandBufferCount; ++registered) {
+            auto buffer = std::make_unique<CommandBufferWrapper>(info->commandPool);
+            // Live command buffer handles are unique within the device.
+            record->commandBuffers.emplace(buffers[registered], std::move(buffer));
+        }
+    } catch (const std::bad_alloc&) {
+        {
+            std::lock_guard<std::mutex> guard(stateMutex);
+            for (uint32_t i = 0; i < registered; ++i) record->commandBuffers.erase(buffers[i]);
+        }
+        // Roll back this entire downstream batch, leaving older allocations intact.
+        auto free = reinterpret_cast<PFN_vkFreeCommandBuffers>(record->getProcAddr(device, "vkFreeCommandBuffers"));
+        free(device, info->commandPool, info->commandBufferCount, buffers);
+        for (uint32_t i = 0; i < info->commandBufferCount; ++i) buffers[i] = VK_NULL_HANDLE;
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+    return VK_SUCCESS;
+}
+
+VKAPI_ATTR void VKAPI_CALL freeCommandBuffers(VkDevice device, VkCommandPool pool,
+        uint32_t count, const VkCommandBuffer* buffers) {
+    auto* record = findDevice(dispatchKey(device));
+    if (!record) return;
+    {
+        std::lock_guard<std::mutex> guard(stateMutex);
+        for (uint32_t i = 0; i < count; ++i) record->commandBuffers.erase(buffers[i]);
+    }
+    auto free = reinterpret_cast<PFN_vkFreeCommandBuffers>(record->getProcAddr(device, "vkFreeCommandBuffers"));
+    free(device, pool, count, buffers);
+}
+
+VKAPI_ATTR void VKAPI_CALL destroyCommandPool(VkDevice device, VkCommandPool pool,
+        const VkAllocationCallbacks* allocator) {
+    auto* record = findDevice(dispatchKey(device));
+    if (!record) return;
+    {
+        std::lock_guard<std::mutex> guard(stateMutex);
+        for (auto it = record->commandBuffers.begin(); it != record->commandBuffers.end();) {
+            if (it->second->pool == pool) it = record->commandBuffers.erase(it);
+            else ++it;
+        }
+    }
+    auto destroy = reinterpret_cast<PFN_vkDestroyCommandPool>(record->getProcAddr(device, "vkDestroyCommandPool"));
+    destroy(device, pool, allocator);
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL beginCommandBuffer(VkCommandBuffer buffer,
+        const VkCommandBufferBeginInfo* info) {
+    auto* device = findDevice(dispatchKey(buffer));
+    if (!device) return VK_ERROR_INITIALIZATION_FAILED;
+    auto begin = reinterpret_cast<PFN_vkBeginCommandBuffer>(device->getProcAddr(device->handle, "vkBeginCommandBuffer"));
+    VkResult result = begin(buffer, info);
+    if (result == VK_SUCCESS) {
+        std::lock_guard<std::mutex> guard(stateMutex);
+        auto it = device->commandBuffers.find(buffer);
+        if (it != device->commandBuffers.end()) it->second->recordingState = CommandBufferWrapper::RecordingState::Recording;
+    }
+    return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL endCommandBuffer(VkCommandBuffer buffer) {
+    auto* device = findDevice(dispatchKey(buffer));
+    if (!device) return VK_ERROR_INITIALIZATION_FAILED;
+    auto end = reinterpret_cast<PFN_vkEndCommandBuffer>(device->getProcAddr(device->handle, "vkEndCommandBuffer"));
+    VkResult result = end(buffer);
+    {
+        std::lock_guard<std::mutex> guard(stateMutex);
+        auto it = device->commandBuffers.find(buffer);
+        if (it != device->commandBuffers.end()) {
+            it->second->recordingState = result == VK_SUCCESS
+                ? CommandBufferWrapper::RecordingState::Executable : CommandBufferWrapper::RecordingState::Invalid;
+        }
+    }
+    return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL resetCommandBuffer(VkCommandBuffer buffer, VkCommandBufferResetFlags flags) {
+    auto* device = findDevice(dispatchKey(buffer));
+    if (!device) return VK_ERROR_INITIALIZATION_FAILED;
+    auto reset = reinterpret_cast<PFN_vkResetCommandBuffer>(device->getProcAddr(device->handle, "vkResetCommandBuffer"));
+    VkResult result = reset(buffer, flags);
+    if (result == VK_SUCCESS) {
+        std::lock_guard<std::mutex> guard(stateMutex);
+        auto it = device->commandBuffers.find(buffer);
+        if (it != device->commandBuffers.end()) it->second->recordingState = CommandBufferWrapper::RecordingState::Initial;
+    }
+    return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL resetCommandPool(VkDevice handle, VkCommandPool pool,
+        VkCommandPoolResetFlags flags) {
+    auto* device = findDevice(dispatchKey(handle));
+    if (!device) return VK_ERROR_INITIALIZATION_FAILED;
+    auto reset = reinterpret_cast<PFN_vkResetCommandPool>(device->getProcAddr(handle, "vkResetCommandPool"));
+    VkResult result = reset(handle, pool, flags);
+    if (result == VK_SUCCESS) {
+        std::lock_guard<std::mutex> guard(stateMutex);
+        for (auto& entry : device->commandBuffers) {
+            if (entry.second->pool == pool) {
+                entry.second->recordingState = CommandBufferWrapper::RecordingState::Initial;
+            }
+        }
+    }
+    return result;
 }
 
 VkResult enumerateLayer(uint32_t* count, VkLayerProperties* properties) {
@@ -193,6 +320,13 @@ PPT_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice
     if (!record) return nullptr;
     if (!std::strcmp(name, "vkGetDeviceProcAddr")) return reinterpret_cast<PFN_vkVoidFunction>(vkGetDeviceProcAddr);
     if (!std::strcmp(name, "vkDestroyDevice")) return reinterpret_cast<PFN_vkVoidFunction>(destroyDevice);
+    if (!std::strcmp(name, "vkAllocateCommandBuffers")) return reinterpret_cast<PFN_vkVoidFunction>(allocateCommandBuffers);
+    if (!std::strcmp(name, "vkFreeCommandBuffers")) return reinterpret_cast<PFN_vkVoidFunction>(freeCommandBuffers);
+    if (!std::strcmp(name, "vkDestroyCommandPool")) return reinterpret_cast<PFN_vkVoidFunction>(destroyCommandPool);
+    if (!std::strcmp(name, "vkBeginCommandBuffer")) return reinterpret_cast<PFN_vkVoidFunction>(beginCommandBuffer);
+    if (!std::strcmp(name, "vkEndCommandBuffer")) return reinterpret_cast<PFN_vkVoidFunction>(endCommandBuffer);
+    if (!std::strcmp(name, "vkResetCommandBuffer")) return reinterpret_cast<PFN_vkVoidFunction>(resetCommandBuffer);
+    if (!std::strcmp(name, "vkResetCommandPool")) return reinterpret_cast<PFN_vkVoidFunction>(resetCommandPool);
     return record->getProcAddr(device, name);
 }
 
@@ -207,6 +341,13 @@ PPT_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInst
     ENTRY("vkCreateDevice", createDevice);
     ENTRY("vkDestroyInstance", destroyInstance);
     ENTRY("vkDestroyDevice", destroyDevice);
+    ENTRY("vkAllocateCommandBuffers", allocateCommandBuffers);
+    ENTRY("vkFreeCommandBuffers", freeCommandBuffers);
+    ENTRY("vkDestroyCommandPool", destroyCommandPool);
+    ENTRY("vkBeginCommandBuffer", beginCommandBuffer);
+    ENTRY("vkEndCommandBuffer", endCommandBuffer);
+    ENTRY("vkResetCommandBuffer", resetCommandBuffer);
+    ENTRY("vkResetCommandPool", resetCommandPool);
     ENTRY("vkGetDeviceProcAddr", vkGetDeviceProcAddr);
     ENTRY("vkEnumerateDeviceLayerProperties", vkEnumerateDeviceLayerProperties);
     ENTRY("vkEnumerateDeviceExtensionProperties", vkEnumerateDeviceExtensionProperties);
