@@ -4,9 +4,11 @@
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
 #include <cstring>
+#include <memory>
 #include <mutex>
 #include <new>
 #include <unordered_map>
+#include <utility>
 
 #define PPT_EXPORT extern "C" __attribute__((visibility("default")))
 
@@ -34,11 +36,15 @@ struct InstanceWrapper {
     // Forward function lookups to the next layer.
     PFN_vkGetInstanceProcAddr getProcAddr;
     InstanceFns next;
+    InstanceWrapper(VkInstance vkHandle, PFN_vkGetInstanceProcAddr vkGetProcAddr, const InstanceFns& vkNext)
+        : handle(vkHandle), getProcAddr(vkGetProcAddr), next(vkNext) {}
 };
 struct DeviceWrapper {
     // Forward function lookups to the next layer.
     PFN_vkGetDeviceProcAddr getProcAddr;
     DeviceFns next;
+    DeviceWrapper(PFN_vkGetDeviceProcAddr vkGetProcAddr, const DeviceFns& vkNext)
+        : getProcAddr(vkGetProcAddr), next(vkNext) {}
 };
 
 // A physical device shares its instance's dispatch table. Key by that table so
@@ -48,18 +54,18 @@ template <typename Handle> void* dispatchKey(Handle handle) {
 }
 
 std::mutex stateMutex;
-std::unordered_map<void*, InstanceWrapper*> instances;
-std::unordered_map<void*, DeviceWrapper*> devices;
+std::unordered_map<void*, std::unique_ptr<InstanceWrapper>> instances;
+std::unordered_map<void*, std::unique_ptr<DeviceWrapper>> devices;
 
 template <typename Handle> InstanceWrapper* findInstance(Handle instance) {
     std::lock_guard<std::mutex> guard(stateMutex);
     auto it = instances.find(dispatchKey(instance));
-    return it == instances.end() ? nullptr : it->second;
+    return it == instances.end() ? nullptr : it->second.get();
 }
 DeviceWrapper* findDevice(void* key) {
     std::lock_guard<std::mutex> guard(stateMutex);
     auto it = devices.find(key);
-    return it == devices.end() ? nullptr : it->second;
+    return it == devices.end() ? nullptr : it->second.get();
 }
 
 template <typename Info> Info* findLink(const void* next, VkStructureType type) {
@@ -86,17 +92,15 @@ VKAPI_ATTR VkResult VKAPI_CALL createInstance(const VkInstanceCreateInfo* info,
 #define X(name) next.name = reinterpret_cast<PFN_vk##name>(getProcAddr(*instance, "vk" #name));
     PPT_INSTANCE_FUNCS(X)
 #undef X
-    InstanceWrapper* record = nullptr;
     try {
-        record = new InstanceWrapper{*instance, getProcAddr, next};
+        std::unique_ptr<InstanceWrapper> record = std::make_unique<InstanceWrapper>(*instance, getProcAddr, next);
         std::lock_guard<std::mutex> guard(stateMutex);
         // This key should not already be in the map.
         // If duplicate keys become possible, update this code to handle them.
-        instances.emplace(dispatchKey(*instance), record);
+        instances.emplace(dispatchKey(*instance), std::move(record));
     } catch (const std::bad_alloc&) {
         // The lock has unwound; roll back the downstream object as well as our record.
         next.DestroyInstance(*instance, allocator);
-        delete record;
         *instance = VK_NULL_HANDLE;
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
@@ -105,16 +109,15 @@ VKAPI_ATTR VkResult VKAPI_CALL createInstance(const VkInstanceCreateInfo* info,
 
 VKAPI_ATTR void VKAPI_CALL destroyInstance(VkInstance instance, const VkAllocationCallbacks* allocator) {
     if (!instance) return;
-    InstanceWrapper* record;
+    std::unique_ptr<InstanceWrapper> record;
     {
         std::lock_guard<std::mutex> guard(stateMutex);
         auto it = instances.find(dispatchKey(instance));
         if (it == instances.end()) return;
-        record = it->second;
+        record = std::move(it->second);
         instances.erase(it);
     }
     record->next.DestroyInstance(instance, allocator);
-    delete record;
 }
 
 VKAPI_ATTR VkResult VKAPI_CALL createDevice(VkPhysicalDevice physicalDevice,
@@ -134,16 +137,14 @@ VKAPI_ATTR VkResult VKAPI_CALL createDevice(VkPhysicalDevice physicalDevice,
 #define X(name) next.name = reinterpret_cast<PFN_vk##name>(getDeviceProcAddr(*device, "vk" #name));
     PPT_DEVICE_FUNCS(X)
 #undef X
-    DeviceWrapper* record = nullptr;
     try {
-        record = new DeviceWrapper{getDeviceProcAddr, next};
+        std::unique_ptr<DeviceWrapper> record = std::make_unique<DeviceWrapper>(getDeviceProcAddr, next);
         std::lock_guard<std::mutex> guard(stateMutex);
         // This key should not already be in the map.
         // If duplicate keys become possible, update this code to handle them.
-        devices.emplace(dispatchKey(*device), record);
+        devices.emplace(dispatchKey(*device), std::move(record));
     } catch (const std::bad_alloc&) {
         next.DestroyDevice(*device, allocator);
-        delete record;
         *device = VK_NULL_HANDLE;
         return VK_ERROR_OUT_OF_HOST_MEMORY;
     }
@@ -152,16 +153,15 @@ VKAPI_ATTR VkResult VKAPI_CALL createDevice(VkPhysicalDevice physicalDevice,
 
 VKAPI_ATTR void VKAPI_CALL destroyDevice(VkDevice device, const VkAllocationCallbacks* allocator) {
     if (!device) return;
-    DeviceWrapper* record;
+    std::unique_ptr<DeviceWrapper> record;
     {
         std::lock_guard<std::mutex> guard(stateMutex);
         auto it = devices.find(dispatchKey(device));
         if (it == devices.end()) return;
-        record = it->second;
+        record = std::move(it->second);
         devices.erase(it);
     }
     record->next.DestroyDevice(device, allocator);
-    delete record;
 }
 
 VkResult enumerateLayer(uint32_t* count, VkLayerProperties* properties) {
