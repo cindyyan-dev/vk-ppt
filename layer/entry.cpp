@@ -1,7 +1,8 @@
 // Android loads the exported functions directly from the shared library. The loader's
 // create-info links supply the next layer's entry points; commands this layer does not
 // hook go straight to them.
-#include <vulkan/vulkan.h>
+#include "hooks.h"
+#include "state.h"
 #include <vulkan/vk_layer.h>
 #include <cstring>
 #include <memory>
@@ -12,56 +13,13 @@
 
 #define PPT_EXPORT extern "C" __attribute__((visibility("default")))
 
+using namespace ppt;
+
+std::mutex ppt::stateMutex;
+
 namespace {
 constexpr const char* kLayerName = "VK_LAYER_PPT_perdraw";
 
-// Filled once when the instance or device is created,
-// not looked up by name on every call.
-#define PPT_INSTANCE_FUNCS(X) X(DestroyInstance) X(EnumerateDeviceExtensionProperties)
-#define PPT_DEVICE_FUNCS(X) \
-    X(DestroyDevice) X(AllocateCommandBuffers) X(FreeCommandBuffers) X(DestroyCommandPool)
-
-struct InstanceFns {
-#define X(name) PFN_vk##name name = nullptr;
-    PPT_INSTANCE_FUNCS(X)
-#undef X
-};
-struct DeviceFns {
-#define X(name) PFN_vk##name name = nullptr;
-    PPT_DEVICE_FUNCS(X)
-#undef X
-};
-
-struct InstanceWrapper {
-    VkInstance handle;
-    // Forward function lookups to the next layer.
-    PFN_vkGetInstanceProcAddr getProcAddr;
-    InstanceFns next;
-    InstanceWrapper(VkInstance vkHandle, PFN_vkGetInstanceProcAddr vkGetProcAddr, const InstanceFns& vkNext)
-        : handle(vkHandle), getProcAddr(vkGetProcAddr), next(vkNext) {}
-};
-struct CommandBufferWrapper {
-    VkCommandPool pool;
-    explicit CommandBufferWrapper(VkCommandPool vkPool) : pool(vkPool) {}
-};
-
-struct DeviceWrapper {
-    // Forward function lookups to the next layer.
-    PFN_vkGetDeviceProcAddr getProcAddr;
-    DeviceFns next;
-    // Key by the full handle: command buffers share the device's dispatch table.
-    std::unordered_map<VkCommandBuffer, std::unique_ptr<CommandBufferWrapper>> commandBuffers;
-    DeviceWrapper(PFN_vkGetDeviceProcAddr vkGetProcAddr, const DeviceFns& vkNext)
-        : getProcAddr(vkGetProcAddr), next(vkNext) {}
-};
-
-// A physical device shares its instance's dispatch table. Key by that table so
-// vkCreateDevice can find the next instance entry point from a physical device.
-template <typename Handle> void* dispatchKey(Handle handle) {
-    return *reinterpret_cast<void**>(handle);
-}
-
-std::mutex stateMutex;
 std::unordered_map<void*, std::unique_ptr<InstanceWrapper>> instances;
 std::unordered_map<void*, std::unique_ptr<DeviceWrapper>> devices;
 
@@ -70,12 +28,6 @@ template <typename Handle> InstanceWrapper* findInstance(Handle instance) {
     auto it = instances.find(dispatchKey(instance));
     return it == instances.end() ? nullptr : it->second.get();
 }
-DeviceWrapper* findDevice(void* key) {
-    std::lock_guard<std::mutex> guard(stateMutex);
-    auto it = devices.find(key);
-    return it == devices.end() ? nullptr : it->second.get();
-}
-
 template <typename Info> Info* findLink(const void* next, VkStructureType type) {
     auto* node = reinterpret_cast<Info*>(const_cast<void*>(next));
     while (node) {
@@ -173,61 +125,6 @@ VKAPI_ATTR void VKAPI_CALL destroyDevice(VkDevice device, const VkAllocationCall
     record->next.DestroyDevice(device, allocator);
 }
 
-VKAPI_ATTR VkResult VKAPI_CALL allocateCommandBuffers(VkDevice device,
-        const VkCommandBufferAllocateInfo* info, VkCommandBuffer* buffers) {
-    auto* record = findDevice(dispatchKey(device));
-    if (!record) {
-        for (uint32_t i = 0; i < info->commandBufferCount; ++i) buffers[i] = VK_NULL_HANDLE;
-        return VK_ERROR_OUT_OF_HOST_MEMORY;
-    }
-    VkResult result = record->next.AllocateCommandBuffers(device, info, buffers);
-    if (result != VK_SUCCESS || info->level != VK_COMMAND_BUFFER_LEVEL_PRIMARY) return result;
-    uint32_t registered = 0;
-    try {
-        std::lock_guard<std::mutex> guard(stateMutex);
-        for (; registered < info->commandBufferCount; ++registered) {
-            auto buffer = std::make_unique<CommandBufferWrapper>(info->commandPool);
-            // Live command buffer handles are unique within the device.
-            record->commandBuffers.emplace(buffers[registered], std::move(buffer));
-        }
-    } catch (const std::bad_alloc&) {
-        {
-            std::lock_guard<std::mutex> guard(stateMutex);
-            for (uint32_t i = 0; i < registered; ++i) record->commandBuffers.erase(buffers[i]);
-        }
-        // Roll back this entire downstream batch, leaving older allocations intact.
-        record->next.FreeCommandBuffers(device, info->commandPool, info->commandBufferCount, buffers);
-        for (uint32_t i = 0; i < info->commandBufferCount; ++i) buffers[i] = VK_NULL_HANDLE;
-        return VK_ERROR_OUT_OF_HOST_MEMORY;
-    }
-    return VK_SUCCESS;
-}
-
-VKAPI_ATTR void VKAPI_CALL freeCommandBuffers(VkDevice device, VkCommandPool pool,
-        uint32_t count, const VkCommandBuffer* buffers) {
-    auto* record = findDevice(dispatchKey(device));
-    if (!record) return;
-    {
-        std::lock_guard<std::mutex> guard(stateMutex);
-        for (uint32_t i = 0; i < count; ++i) record->commandBuffers.erase(buffers[i]);
-    }
-    record->next.FreeCommandBuffers(device, pool, count, buffers);
-}
-
-VKAPI_ATTR void VKAPI_CALL destroyCommandPool(VkDevice device, VkCommandPool pool,
-        const VkAllocationCallbacks* allocator) {
-    auto* record = findDevice(dispatchKey(device));
-    if (!record) return;
-    {
-        std::lock_guard<std::mutex> guard(stateMutex);
-        for (auto it = record->commandBuffers.begin(); it != record->commandBuffers.end();) {
-            if (it->second->pool == pool) it = record->commandBuffers.erase(it);
-            else ++it;
-        }
-    }
-    record->next.DestroyCommandPool(device, pool, allocator);
-}
-
 VkResult enumerateLayer(uint32_t* count, VkLayerProperties* properties) {
     if (!properties) { *count = 1; return VK_SUCCESS; }
     if (*count == 0) return VK_INCOMPLETE;
@@ -241,6 +138,12 @@ VkResult enumerateLayer(uint32_t* count, VkLayerProperties* properties) {
     return VK_SUCCESS;
 }
 } // namespace
+
+ppt::DeviceWrapper* ppt::findDevice(void* key) {
+    std::lock_guard<std::mutex> guard(stateMutex);
+    auto it = devices.find(key);
+    return it == devices.end() ? nullptr : it->second.get();
+}
 
 PPT_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateInstanceLayerProperties(uint32_t* count, VkLayerProperties* properties) {
     return enumerateLayer(count, properties);
