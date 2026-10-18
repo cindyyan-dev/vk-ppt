@@ -12,6 +12,7 @@ if(NOT VULKAN_HEADERS)
 endif()
 
 add_library(VkLayer_ppt SHARED layer/entry.cpp)
+target_link_libraries(VkLayer_ppt PRIVATE log)
 target_include_directories(VkLayer_ppt PRIVATE "${VULKAN_HEADERS}")
 target_compile_definitions(VkLayer_ppt PRIVATE VK_NO_PROTOTYPES)
 target_compile_options(VkLayer_ppt PRIVATE -fvisibility=hidden -Wall -Wextra -Wshadow)

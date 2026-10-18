@@ -3,6 +3,10 @@
 // those entry points without an extra wrapper in this layer.
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_layer.h>
+#include "primitives.h"
+#include <android/log.h>
+#include <sys/system_properties.h>
+#include <cinttypes>
 #include <cstring>
 #include <memory>
 #include <mutex>
@@ -29,6 +33,8 @@ struct CommandBufferWrapper {
     enum class RecordingState { Initial, Recording, Executable, Invalid };
     VkCommandPool pool;
     RecordingState recordingState = RecordingState::Initial;
+    InputAssembly assembly;
+    VkPrimitiveTopology dynamicTopology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
     explicit CommandBufferWrapper(VkCommandPool vkPool) : pool(vkPool) {}
 };
 
@@ -41,8 +47,14 @@ struct DeviceWrapper {
     PFN_vkDestroyDevice destroy;
     // Key by the full handle: command buffers share the device's dispatch table.
     std::unordered_map<VkCommandBuffer, std::unique_ptr<CommandBufferWrapper>> commandBuffers;
+    std::unordered_map<VkPipeline, InputAssembly> pipelines;
+    bool tracePrimitives;
     DeviceWrapper(VkDevice vkHandle, PFN_vkGetDeviceProcAddr vkGetProcAddr, PFN_vkDestroyDevice vkDestroy)
-        : handle(vkHandle), getProcAddr(vkGetProcAddr), destroy(vkDestroy) {}
+        : handle(vkHandle), getProcAddr(vkGetProcAddr), destroy(vkDestroy) {
+        char value[PROP_VALUE_MAX]{};
+        __system_property_get("debug.ppt.primitives", value);
+        tracePrimitives = std::strcmp(value, "1") == 0;
+    }
 };
 
 // A physical device shares its instance's dispatch table. Key by that table so
@@ -222,7 +234,11 @@ VKAPI_ATTR VkResult VKAPI_CALL beginCommandBuffer(VkCommandBuffer buffer,
     if (result == VK_SUCCESS) {
         std::lock_guard<std::mutex> guard(stateMutex);
         auto it = device->commandBuffers.find(buffer);
-        if (it != device->commandBuffers.end()) it->second->recordingState = CommandBufferWrapper::RecordingState::Recording;
+        if (it != device->commandBuffers.end()) {
+            it->second->assembly = {};
+            it->second->dynamicTopology = VK_PRIMITIVE_TOPOLOGY_MAX_ENUM;
+            it->second->recordingState = CommandBufferWrapper::RecordingState::Recording;
+        }
     }
     return result;
 }
@@ -271,6 +287,123 @@ VKAPI_ATTR VkResult VKAPI_CALL resetCommandPool(VkDevice handle, VkCommandPool p
         }
     }
     return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL createGraphicsPipelines(VkDevice handle, VkPipelineCache cache,
+        uint32_t count, const VkGraphicsPipelineCreateInfo* infos, const VkAllocationCallbacks* allocator,
+        VkPipeline* pipelines) {
+    auto* device = findDevice(dispatchKey(handle));
+    auto create = reinterpret_cast<PFN_vkCreateGraphicsPipelines>(device->getProcAddr(handle, "vkCreateGraphicsPipelines"));
+    VkResult result = create(handle, cache, count, infos, allocator, pipelines);
+    if (device->tracePrimitives) {
+        try {
+            std::lock_guard<std::mutex> guard(stateMutex);
+            for (uint32_t i = 0; i < count; ++i) {
+                if (pipelines[i]) device->pipelines.emplace(pipelines[i], pipelineAssembly(infos[i]));
+            }
+        } catch (const std::bad_alloc&) {
+            __android_log_print(ANDROID_LOG_WARN, "vk-ppt", "Could not record pipeline input assembly");
+        }
+    }
+    return result;
+}
+
+VKAPI_ATTR void VKAPI_CALL destroyPipeline(VkDevice handle, VkPipeline pipeline, const VkAllocationCallbacks* allocator) {
+    auto* device = findDevice(dispatchKey(handle));
+    if (device->tracePrimitives) {
+        std::lock_guard<std::mutex> guard(stateMutex);
+        device->pipelines.erase(pipeline);
+    }
+    auto destroy = reinterpret_cast<PFN_vkDestroyPipeline>(device->getProcAddr(handle, "vkDestroyPipeline"));
+    destroy(handle, pipeline, allocator);
+}
+
+VKAPI_ATTR void VKAPI_CALL cmdBindPipeline(VkCommandBuffer buffer, VkPipelineBindPoint point, VkPipeline pipeline) {
+    auto* device = findDevice(dispatchKey(buffer));
+    if (device->tracePrimitives && point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+        std::lock_guard<std::mutex> guard(stateMutex);
+        auto cb = device->commandBuffers.find(buffer);
+        if (cb != device->commandBuffers.end()) {
+            auto it = device->pipelines.find(pipeline);
+            cb->second->assembly = it == device->pipelines.end() ? InputAssembly{} : it->second;
+        }
+    }
+    auto bind = reinterpret_cast<PFN_vkCmdBindPipeline>(device->getProcAddr(device->handle, "vkCmdBindPipeline"));
+    bind(buffer, point, pipeline);
+}
+
+template <bool ext>
+VKAPI_ATTR void VKAPI_CALL cmdSetPrimitiveTopology(VkCommandBuffer buffer, VkPrimitiveTopology topology) {
+    auto* device = findDevice(dispatchKey(buffer));
+    if (device->tracePrimitives) {
+        std::lock_guard<std::mutex> guard(stateMutex);
+        auto cb = device->commandBuffers.find(buffer);
+        if (cb != device->commandBuffers.end()) cb->second->dynamicTopology = topology;
+    }
+    auto set = reinterpret_cast<PFN_vkCmdSetPrimitiveTopology>(device->getProcAddr(device->handle,
+        ext ? "vkCmdSetPrimitiveTopologyEXT" : "vkCmdSetPrimitiveTopology"));
+    set(buffer, topology);
+}
+
+VKAPI_ATTR void VKAPI_CALL cmdBindShadersEXT(VkCommandBuffer buffer, uint32_t count,
+        const VkShaderStageFlagBits* stages, const VkShaderEXT* shaders) {
+    auto* device = findDevice(dispatchKey(buffer));
+    if (device->tracePrimitives) {
+        for (uint32_t i = 0; i < count; ++i) {
+            if (stages[i] == VK_SHADER_STAGE_COMPUTE_BIT) continue;
+            std::lock_guard<std::mutex> guard(stateMutex);
+            auto cb = device->commandBuffers.find(buffer);
+            if (cb != device->commandBuffers.end()) cb->second->assembly = {};
+            break;
+        }
+    }
+    auto bind = reinterpret_cast<PFN_vkCmdBindShadersEXT>(device->getProcAddr(device->handle, "vkCmdBindShadersEXT"));
+    bind(buffer, count, stages, shaders);
+}
+
+void traceDraw(DeviceWrapper* device, VkCommandBuffer buffer, uint32_t count, uint32_t instancesCount, bool indexed) {
+    std::optional<uint64_t> primitives;
+    {
+        std::lock_guard<std::mutex> guard(stateMutex);
+        auto cb = device->commandBuffers.find(buffer);
+        if (cb == device->commandBuffers.end() ||
+            cb->second->recordingState != CommandBufferWrapper::RecordingState::Recording) return;
+        const auto& assembly = cb->second->assembly;
+        auto topology = assembly.dynamicTopology ? cb->second->dynamicTopology : assembly.topology;
+        primitives = primitiveCount(topology, count, instancesCount, indexed && assembly.mayRestart);
+    }
+    const char* command = indexed ? "vkCmdDrawIndexed" : "vkCmdDraw";
+    if (primitives) __android_log_print(ANDROID_LOG_INFO, "vk-ppt", "%s input primitives=%" PRIu64, command, *primitives);
+    else __android_log_print(ANDROID_LOG_INFO, "vk-ppt", "%s input primitives=unknown", command);
+}
+
+VKAPI_ATTR void VKAPI_CALL cmdDraw(VkCommandBuffer buffer, uint32_t vertices, uint32_t instanceCount,
+        uint32_t firstVertex, uint32_t firstInstance) {
+    auto* device = findDevice(dispatchKey(buffer));
+    if (device->tracePrimitives) traceDraw(device, buffer, vertices, instanceCount, false);
+    auto draw = reinterpret_cast<PFN_vkCmdDraw>(device->getProcAddr(device->handle, "vkCmdDraw"));
+    draw(buffer, vertices, instanceCount, firstVertex, firstInstance);
+}
+
+VKAPI_ATTR void VKAPI_CALL cmdDrawIndexed(VkCommandBuffer buffer, uint32_t indices, uint32_t instanceCount,
+        uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance) {
+    auto* device = findDevice(dispatchKey(buffer));
+    if (device->tracePrimitives) traceDraw(device, buffer, indices, instanceCount, true);
+    auto draw = reinterpret_cast<PFN_vkCmdDrawIndexed>(device->getProcAddr(device->handle, "vkCmdDrawIndexed"));
+    draw(buffer, indices, instanceCount, firstIndex, vertexOffset, firstInstance);
+}
+
+PFN_vkVoidFunction drawHook(const char* name, PFN_vkVoidFunction next) {
+    if (!next) return nullptr;
+    if (!std::strcmp(name, "vkCreateGraphicsPipelines")) return reinterpret_cast<PFN_vkVoidFunction>(createGraphicsPipelines);
+    if (!std::strcmp(name, "vkDestroyPipeline")) return reinterpret_cast<PFN_vkVoidFunction>(destroyPipeline);
+    if (!std::strcmp(name, "vkCmdBindPipeline")) return reinterpret_cast<PFN_vkVoidFunction>(cmdBindPipeline);
+    if (!std::strcmp(name, "vkCmdDraw")) return reinterpret_cast<PFN_vkVoidFunction>(cmdDraw);
+    if (!std::strcmp(name, "vkCmdDrawIndexed")) return reinterpret_cast<PFN_vkVoidFunction>(cmdDrawIndexed);
+    if (!std::strcmp(name, "vkCmdSetPrimitiveTopology")) return reinterpret_cast<PFN_vkVoidFunction>(cmdSetPrimitiveTopology<false>);
+    if (!std::strcmp(name, "vkCmdSetPrimitiveTopologyEXT")) return reinterpret_cast<PFN_vkVoidFunction>(cmdSetPrimitiveTopology<true>);
+    if (!std::strcmp(name, "vkCmdBindShadersEXT")) return reinterpret_cast<PFN_vkVoidFunction>(cmdBindShadersEXT);
+    return next;
 }
 
 VkResult enumerateLayer(uint32_t* count, VkLayerProperties* properties) {
@@ -327,7 +460,7 @@ PPT_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice
     if (!std::strcmp(name, "vkEndCommandBuffer")) return reinterpret_cast<PFN_vkVoidFunction>(endCommandBuffer);
     if (!std::strcmp(name, "vkResetCommandBuffer")) return reinterpret_cast<PFN_vkVoidFunction>(resetCommandBuffer);
     if (!std::strcmp(name, "vkResetCommandPool")) return reinterpret_cast<PFN_vkVoidFunction>(resetCommandPool);
-    return record->getProcAddr(device, name);
+    return drawHook(name, record->getProcAddr(device, name));
 }
 
 PPT_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instance, const char* name) {
@@ -353,5 +486,5 @@ PPT_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInst
     ENTRY("vkEnumerateDeviceExtensionProperties", vkEnumerateDeviceExtensionProperties);
 #undef ENTRY
     auto* record = findInstance(instance);
-    return record ? record->getProcAddr(instance, name) : nullptr;
+    return record ? drawHook(name, record->getProcAddr(instance, name)) : nullptr;
 }
