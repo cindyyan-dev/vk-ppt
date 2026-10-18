@@ -11,7 +11,6 @@
 #include <unordered_map>
 #include <utility>
 
-#define PPT_EXPORT extern "C" __attribute__((visibility("default")))
 
 using namespace ppt;
 
@@ -132,7 +131,7 @@ VkResult enumerateLayer(uint32_t* count, VkLayerProperties* properties) {
     std::strcpy(layer.layerName, kLayerName);
     layer.specVersion = VK_API_VERSION_1_1;
     layer.implementationVersion = 1;
-    std::strcpy(layer.description, "Android Vulkan forwarding layer");
+    std::strcpy(layer.description, "Counts primitives per draw");
     *properties = layer;
     *count = 1;
     return VK_SUCCESS;
@@ -170,16 +169,40 @@ PPT_EXPORT VKAPI_ATTR VkResult VKAPI_CALL vkEnumerateDeviceExtensionProperties(V
     return record->next.EnumerateDeviceExtensionProperties(physicalDevice, name, count, properties);
 }
 
+static PFN_vkVoidFunction deviceProcAddr(const char* name, PFN_vkVoidFunction next) {
+    if (!next) return nullptr;
+    static const struct {
+        const char* name;
+        PFN_vkVoidFunction hook;
+    } entries[] = {
+        {"vkGetDeviceProcAddr", reinterpret_cast<PFN_vkVoidFunction>(vkGetDeviceProcAddr)},
+        {"vkDestroyDevice", reinterpret_cast<PFN_vkVoidFunction>(destroyDevice)},
+        {"vkAllocateCommandBuffers", reinterpret_cast<PFN_vkVoidFunction>(allocateCommandBuffers)},
+        {"vkFreeCommandBuffers", reinterpret_cast<PFN_vkVoidFunction>(freeCommandBuffers)},
+        {"vkDestroyCommandPool", reinterpret_cast<PFN_vkVoidFunction>(destroyCommandPool)},
+        {"vkBeginCommandBuffer", reinterpret_cast<PFN_vkVoidFunction>(beginCommandBuffer)},
+        {"vkResetCommandBuffer", reinterpret_cast<PFN_vkVoidFunction>(resetCommandBuffer)},
+        {"vkResetCommandPool", reinterpret_cast<PFN_vkVoidFunction>(resetCommandPool)},
+        {"vkCreateGraphicsPipelines", reinterpret_cast<PFN_vkVoidFunction>(createGraphicsPipelines)},
+        {"vkDestroyPipeline", reinterpret_cast<PFN_vkVoidFunction>(destroyPipeline)},
+        {"vkCmdBindPipeline", reinterpret_cast<PFN_vkVoidFunction>(cmdBindPipeline)},
+        {"vkCmdDraw", reinterpret_cast<PFN_vkVoidFunction>(cmdDraw)},
+        {"vkCmdDrawIndexed", reinterpret_cast<PFN_vkVoidFunction>(cmdDrawIndexed)},
+        {"vkCmdSetPrimitiveTopology", reinterpret_cast<PFN_vkVoidFunction>(cmdSetPrimitiveTopology)},
+        {"vkCmdSetPrimitiveTopologyEXT", reinterpret_cast<PFN_vkVoidFunction>(cmdSetPrimitiveTopologyEXT)},
+        {"vkCmdBindShadersEXT", reinterpret_cast<PFN_vkVoidFunction>(cmdBindShadersEXT)},
+    };
+    for (const auto& entry : entries) {
+        if (!std::strcmp(name, entry.name)) return entry.hook;
+    }
+    return next;
+}
+
 PPT_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetDeviceProcAddr(VkDevice device, const char* name) {
     if (!device || !name) return nullptr;
     auto* record = findDevice(dispatchKey(device));
     if (!record) return nullptr;
-    if (!std::strcmp(name, "vkGetDeviceProcAddr")) return reinterpret_cast<PFN_vkVoidFunction>(vkGetDeviceProcAddr);
-    if (!std::strcmp(name, "vkDestroyDevice")) return reinterpret_cast<PFN_vkVoidFunction>(destroyDevice);
-    if (!std::strcmp(name, "vkAllocateCommandBuffers")) return reinterpret_cast<PFN_vkVoidFunction>(allocateCommandBuffers);
-    if (!std::strcmp(name, "vkFreeCommandBuffers")) return reinterpret_cast<PFN_vkVoidFunction>(freeCommandBuffers);
-    if (!std::strcmp(name, "vkDestroyCommandPool")) return reinterpret_cast<PFN_vkVoidFunction>(destroyCommandPool);
-    return record->getProcAddr(device, name);
+    return deviceProcAddr(name, record->getProcAddr(device, name));
 }
 
 PPT_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInstance instance, const char* name) {
@@ -192,14 +215,10 @@ PPT_EXPORT VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL vkGetInstanceProcAddr(VkInst
     if (!instance) return nullptr;
     ENTRY("vkCreateDevice", createDevice);
     ENTRY("vkDestroyInstance", destroyInstance);
-    ENTRY("vkDestroyDevice", destroyDevice);
-    ENTRY("vkAllocateCommandBuffers", allocateCommandBuffers);
-    ENTRY("vkFreeCommandBuffers", freeCommandBuffers);
-    ENTRY("vkDestroyCommandPool", destroyCommandPool);
-    ENTRY("vkGetDeviceProcAddr", vkGetDeviceProcAddr);
     ENTRY("vkEnumerateDeviceLayerProperties", vkEnumerateDeviceLayerProperties);
     ENTRY("vkEnumerateDeviceExtensionProperties", vkEnumerateDeviceExtensionProperties);
 #undef ENTRY
     auto* record = findInstance(instance);
-    return record ? record->getProcAddr(instance, name) : nullptr;
+    if (!record) return nullptr;
+    return deviceProcAddr(name, record->getProcAddr(instance, name));
 }

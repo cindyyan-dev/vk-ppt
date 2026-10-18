@@ -60,4 +60,77 @@ VKAPI_ATTR void VKAPI_CALL destroyCommandPool(VkDevice device, VkCommandPool poo
     record->next.DestroyCommandPool(device, pool, allocator);
 }
 
+VKAPI_ATTR VkResult VKAPI_CALL beginCommandBuffer(VkCommandBuffer buffer,
+        const VkCommandBufferBeginInfo* info) {
+    auto* device = findDevice(dispatchKey(buffer));
+    if (!device) return VK_ERROR_OUT_OF_HOST_MEMORY;
+    VkResult result = device->next.BeginCommandBuffer(buffer, info);
+    if (result == VK_SUCCESS) {
+        std::lock_guard<std::mutex> guard(stateMutex);
+        auto it = device->commandBuffers.find(buffer);
+        if (it != device->commandBuffers.end()) {
+            it->second->recording.clear();
+        }
+    }
+    return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL resetCommandBuffer(VkCommandBuffer buffer, VkCommandBufferResetFlags flags) {
+    auto* device = findDevice(dispatchKey(buffer));
+    if (!device) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    VkResult result = device->next.ResetCommandBuffer(buffer, flags);
+    if (result == VK_SUCCESS) {
+        std::lock_guard<std::mutex> guard(stateMutex);
+        auto it = device->commandBuffers.find(buffer);
+        if (it != device->commandBuffers.end()) it->second->recording.clear();
+    }
+    return result;
+}
+
+VKAPI_ATTR VkResult VKAPI_CALL resetCommandPool(VkDevice handle, VkCommandPool pool,
+        VkCommandPoolResetFlags flags) {
+    auto* device = findDevice(dispatchKey(handle));
+    if (!device) return VK_ERROR_OUT_OF_DEVICE_MEMORY;
+    VkResult result = device->next.ResetCommandPool(handle, pool, flags);
+    if (result == VK_SUCCESS) {
+        std::lock_guard<std::mutex> guard(stateMutex);
+        for (auto& entry : device->commandBuffers) {
+            if (entry.second->pool == pool) {
+                entry.second->recording.clear();
+            }
+        }
+    }
+    return result;
+}
+
+static void recordDraw(DeviceWrapper* device, VkCommandBuffer buffer, uint32_t count, uint32_t instanceCount, bool indexed) {
+    std::lock_guard<std::mutex> guard(stateMutex);
+    auto it = device->commandBuffers.find(buffer);
+    if (it == device->commandBuffers.end()) return;
+    auto& recording = it->second->recording;
+    if (!recording.drawCountsComplete) return;
+    auto topology = recording.assembly.topologyIsDynamic ? recording.dynamicTopology : recording.assembly.topology;
+    try {
+        recording.drawPrimitiveCounts.push_back(primitiveCount(topology, count, instanceCount, indexed && recording.assembly.mayRestart));
+    } catch (const std::bad_alloc&) {
+        recording.drawCountsComplete = false;
+    }
+}
+
+VKAPI_ATTR void VKAPI_CALL cmdDraw(VkCommandBuffer buffer, uint32_t vertices, uint32_t instanceCount,
+        uint32_t firstVertex, uint32_t firstInstance) {
+    auto* device = findDevice(dispatchKey(buffer));
+    if (!device) return;
+    recordDraw(device, buffer, vertices, instanceCount, false);
+    device->next.CmdDraw(buffer, vertices, instanceCount, firstVertex, firstInstance);
+}
+
+VKAPI_ATTR void VKAPI_CALL cmdDrawIndexed(VkCommandBuffer buffer, uint32_t indices, uint32_t instanceCount,
+        uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance) {
+    auto* device = findDevice(dispatchKey(buffer));
+    if (!device) return;
+    recordDraw(device, buffer, indices, instanceCount, true);
+    device->next.CmdDrawIndexed(buffer, indices, instanceCount, firstIndex, vertexOffset, firstInstance);
+}
+
 }
